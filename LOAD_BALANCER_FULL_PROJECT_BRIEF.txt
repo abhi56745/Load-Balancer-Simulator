@@ -1,0 +1,751 @@
+LOAD BALANCER SIMULATOR - TECHNICAL BRIEF
+========================================
+
+Document intent
+---------------
+This document explains the current Load Balancer Simulator implementation to technical reviewers who want to understand what the system is, how it works, what was built, and where the main engineering effort went.
+
+This is not a production data-plane load balancer. It is a full-stack simulation and analysis platform that models request distribution across backend servers, compares multiple routing strategies on the same workload, visualizes load spread, and stores recent run history per authenticated user.
+
+All project-specific facts below are taken from the current repository implementation. External references are included only to anchor algorithm terminology and production-context concepts.
+
+
+1. Project Overview
+-------------------
+The project is a full-stack load balancing simulator built around three goals:
+
+- Explain how common and advanced load-balancing algorithms behave.
+- Let a user run controlled experiments from a browser instead of reading theory only.
+- Compare fairness, latency, throughput, overload behavior, and routing stability across algorithms under the same generated workload.
+
+At a high level, the simulator allows an authenticated user to:
+
+- log in or register,
+- configure server count, request count, capacity, and animation speed,
+- run a single algorithm simulation,
+- compare all implemented algorithms on the same request set,
+- inspect metrics and per-server breakdowns,
+- review live routing logs,
+- store recent simulation history in MongoDB.
+
+The current implementation supports 19 algorithms:
+
+- roundrobin
+- swrr
+- least
+- leastoutstanding
+- p2c
+- p2cewma
+- iphash
+- ringhash
+- maglev
+- hrw
+- localityaware
+- random
+- weighted
+- jsq
+- jiq
+- sed
+- boundedch
+- aperture
+- weightedrandomam
+
+The simulator is best described as a teaching, comparison, and systems-analysis tool with a real frontend, real API surface, real authentication, and persistent run history.
+
+
+2. Key Project Layout
+---------------------
+The codebase is split into a backend service and a React frontend:
+
+LOADBALNCER/
+  backend/
+    server.js
+    controllers/simulationController.js
+    routes/authRoutes.js
+    routes/simulationRoutes.js
+    middleware/authMiddleware.js
+    models/User.js
+    models/SimulationResult.js
+    test_algorithms.js
+    .env.example
+  frontend-react/
+    src/App.jsx
+    src/lib/api.js
+    src/components/Login.jsx
+    src/components/Navbar.jsx
+    src/components/Sidebar.jsx
+    src/components/DashboardSection.jsx
+    src/components/SimulationSection.jsx
+    src/components/ChartSection.jsx
+    src/components/ComparisonSection.jsx
+    src/components/AnalyticsSection.jsx
+    src/components/SmartInsights.jsx
+    src/components/ActivitySection.jsx
+    src/components/ResetModal.jsx
+
+Important runtime configuration:
+
+- backend: PORT, MONGO_URI, JWT_SECRET
+- frontend: VITE_API_URL
+
+Default values currently exposed by the repo:
+
+- API server default port: 5000
+- default Mongo URI: mongodb://localhost:27017/loadbalancer
+- frontend API fallback: http://localhost:5000/api
+
+
+3. System Architecture
+----------------------
+3.1 High-level flow
+
+1. The React/Vite client loads and checks whether a token already exists in localStorage.
+2. If a token exists, the client calls /api/auth/me to restore the user session.
+3. Once authenticated, the user can launch one simulation or a cross-algorithm comparison.
+4. The frontend sends query-based requests to the Express API.
+5. The backend generates a synthetic workload, runs the selected algorithm(s), computes metrics, and optionally saves summary data to MongoDB.
+6. The frontend animates the returned routing steps, updates server cards and charts, and renders analytics plus live logs.
+
+3.2 Main runtime path for a single simulation
+
+- Client sends GET /api/simulate with algorithm, numServers, numRequests, and serverCapacity.
+- Backend generates requests with bursty arrivals, random load units, heavy-tail durations, and deterministic pseudo source IPs.
+- Backend initializes synthetic server objects.
+- Backend runs the selection algorithm request by request.
+- Backend resolves overflow by either rerouting to a safe server or auto-scaling a new server.
+- Backend computes server metrics and returns:
+  servers, logs, steps, metrics, requestRouting, and requestSet.
+- Frontend animates arrival steps, rebuilds per-server visual state, and updates charts and analytics.
+
+3.3 Session and security flow
+
+- Public endpoints: /api/auth/register and /api/auth/login.
+- Protected endpoints: /api/simulate, /api/simulate/compare, /api/simulate/history.
+- JWT is issued on login/register, stored in localStorage, and sent as Bearer token by an Axios interceptor.
+- Invalid or expired tokens trigger client-side session clearing and a forced return to login.
+
+3.4 Persistence boundary
+
+- MongoDB stores users and recent simulation summaries.
+- localStorage stores only the token and serialized user object.
+- If MongoDB is unavailable, simulation execution still succeeds; only the history save is skipped.
+
+
+4. Frontend Explanation
+-----------------------
+4.1 Frontend stack
+
+- React 19
+- Vite
+- Axios
+- Chart.js via react-chartjs-2
+- lucide-react
+
+4.2 Frontend control model
+
+The frontend is a state-driven SPA rooted in src/App.jsx. App-level state owns:
+
+- current user
+- active section
+- selected algorithm
+- simulation loading and comparison loading
+- server count, request count, server capacity
+- simulation speed
+- current server snapshots
+- metrics
+- logs
+- run counters and last algorithm
+- comparison payload
+- progress bar state
+- active server highlight
+- reset modal state
+
+The frontend also uses AbortController so a running simulation request can be cancelled from the UI.
+
+4.3 Main screens and behaviors
+
+Login/Register
+- Login.jsx handles both sign-in and sign-up modes.
+- Registration requires username, email, and password.
+- Login requires username and password.
+- Errors are shown inline on the auth card.
+
+Dashboard
+- Shows high-level status cards such as active servers, total runs, last algorithm, total requests, and average requests per server.
+- Pulls recent history from /api/simulate/history.
+- History is limited by the backend to the latest three entries per user.
+- Includes a short quick-start guide for operating the simulator.
+
+Simulation
+- SimulationSection.jsx is the main control surface.
+- User-selectable ranges:
+  servers: 2 to 10
+  requests: 50 to 500
+  capacity: 200 to 3000
+  speed presets: Slow, Normal, Fast
+- Algorithm choices are grouped as Core Algorithms and Advanced Algorithms.
+- Each server card shows live load, percentage usage, active requests, handled requests, and a visual status badge.
+
+Charts
+- ChartSection.jsx renders:
+  a bar chart for load versus capacity
+  a doughnut chart for request-share distribution
+- During animation, charts update in place for smoother transitions.
+- If the simulation has ended and current load is zero, the bar chart can fall back to peak load for visual continuity.
+
+Comparison
+- ComparisonSection.jsx renders all algorithms side by side using the same generated request set.
+- It highlights the best algorithm returned by the backend.
+- Each card displays fairness, efficiency, average latency, P95 latency, overload count, and a per-server handled-request bar chart.
+
+Analytics
+- AnalyticsSection.jsx presents the last simulation's metrics in a compact panel.
+- It includes:
+  average, max, min, and total routed load
+  fairness index
+  average, P50, P95, and P99 latency
+  throughput
+  overloaded server count
+  standard deviation
+- It also shows a per-server table with load, capacity, usage percent, active requests, handled requests, and status.
+
+Smart Insights
+- SmartInsights.jsx translates raw metrics into interpretive observations.
+- It categorizes algorithms as static, adaptive, probabilistic, hash, or locality-based.
+- It flags excellent fairness, overload risk, tail-latency spikes, and uneven hash spread.
+
+Activity
+- ActivitySection.jsx shows live routing logs.
+- It supports filtering by All, Requests, and Errors.
+- It also supports auto-scroll behavior while the simulation is running.
+
+Reset and Stop controls
+- Stop cancels both the in-flight API request and the step animation.
+- Reset opens a confirmation modal and clears current UI state.
+
+4.4 Session handling and API integration
+
+src/lib/api.js centralizes API behavior:
+
+- sets base URL from VITE_API_URL or the localhost fallback,
+- injects Authorization header automatically,
+- stores token and user in localStorage,
+- clears invalid sessions safely.
+
+On app boot, the frontend calls /auth/me if a stored token exists. This prevents stale client-only sessions and rehydrates the current user from the backend.
+
+4.5 Frontend technical notes
+
+- The UI uses richer status bands than the backend summary state. Frontend visual thresholds are:
+  Medium at 50 percent,
+  High at 70 percent,
+  Overloaded at 90 percent.
+- Auto-scaled servers are added to the visual server list when they appear in returned simulation steps.
+- The frontend reconstructs animation state from backend steps rather than trusting only final server objects.
+
+
+5. Backend Explanation
+----------------------
+5.1 Backend stack
+
+- Node.js
+- Express
+- Mongoose
+- bcryptjs
+- jsonwebtoken
+- cors
+- dotenv
+
+5.2 API service structure
+
+server.js does the following:
+
+- loads environment variables,
+- creates the Express app,
+- enables CORS,
+- enables JSON parsing,
+- mounts /api/auth routes,
+- mounts protected simulation routes under /api,
+- connects to MongoDB,
+- starts the HTTP server.
+
+5.3 Authentication layer
+
+authRoutes.js provides:
+
+- POST /api/auth/register
+- POST /api/auth/login
+- GET /api/auth/me
+
+Current auth design:
+
+- passwords are hashed with bcryptjs,
+- JWT contains user id and username,
+- token lifetime is one day,
+- authMiddleware checks Bearer token format and verifies the token before protected routes execute.
+
+5.4 Simulation API layer
+
+simulationRoutes.js is protected by authMiddleware at the router level. It exposes:
+
+- GET /api/simulate
+- GET /api/simulate/compare
+- GET /api/simulate/history
+
+5.5 Simulation engine
+
+simulationController.js is the main backend module and contains:
+
+- hashing helpers,
+- server initialization logic,
+- request generation logic,
+- algorithm selection logic,
+- rerouting and auto-scaling logic,
+- metrics computation,
+- API handlers.
+
+5.6 Synthetic server model
+
+Each server object tracks:
+
+- serverId
+- currentLoad
+- peakLoad
+- activeConnections
+- maxCapacity
+- requestsHandled
+- status
+- weight
+- currentWeight
+- effectiveWeight
+- baseLatency
+- ewma
+- zone
+- isDown
+- autoScaled
+
+Key implementation details:
+
+- base server weight starts near 10 and scales with heterogeneity if enabled,
+- zone alternates A/B,
+- baseLatency and ewma support latency-aware algorithms,
+- autoScaled distinguishes servers added during overflow handling.
+
+5.7 Synthetic request model
+
+Each generated request contains:
+
+- id
+- load
+- arrivalTime
+- duration
+- sourceIP
+
+Current generation behavior:
+
+- 20 percent chance of burst arrival with zero time gap,
+- otherwise a 1 to 15 ms gap,
+- 2 to 9 units of load per request,
+- heavy-tail duration distribution:
+  10 to 30 ms for the majority,
+  30 to 80 ms for a smaller middle tier,
+  100 to 300 ms for the long tail.
+
+5.8 Assignment, overflow, and auto-scaling
+
+The backend does not blindly trust the algorithm's first choice.
+
+Assignment flow:
+
+1. selectServer() chooses a preferred backend according to the algorithm.
+2. If the preferred server has enough remaining capacity, the request stays there.
+3. If not, the controller searches for safe alternatives and sorts them by projected usage, then by active connections.
+4. If no safe alternative exists, the controller creates a new auto-scaled server with base capacity and routes the request there.
+
+This means the simulator evaluates both algorithm behavior and safety-aware overflow handling.
+
+5.9 Latency and metric modeling
+
+The engine computes a synthetic runtime cost for each request:
+
+- queueFactor = max(1, 1 + ((currentLoad / maxCapacity) * 2))
+- realDuration = request duration * queueFactor * (baseLatency / 10)
+- ewma is updated with 30 percent new duration and 70 percent prior ewma
+
+This allows latency-sensitive strategies such as P2C + Peak EWMA and anomaly-mitigated weighted random to react to a moving latency estimate.
+
+5.10 Comparison execution model
+
+The compare endpoint generates one workload, then runs all 19 algorithms against that same request set. This is important because it removes workload drift between algorithms inside one comparison run.
+
+The best algorithm is chosen using a composite score:
+
+- fairnessIndex * 0.6
+- plus (1 - min(1, avgLatency / 200)) * 0.2
+- plus (efficiencyScore / 100) * 0.2
+
+5.11 History persistence behavior
+
+When MongoDB is connected, the backend stores:
+
+- userId
+- algorithm
+- totalRequests
+- final server snapshots
+- createdAt
+
+If MongoDB is disconnected or the write fails, the controller logs a warning and still returns a successful simulation response.
+
+
+6. Database and Persistence
+---------------------------
+6.1 MongoDB models
+
+User
+- username
+- email
+- password
+- createdAt
+
+SimulationResult
+- userId
+- algorithm
+- totalRequests
+- servers[]
+- createdAt
+
+Nested server snapshot fields currently persisted:
+
+- serverId
+- currentLoad
+- peakLoad
+- maxCapacity
+- requestsHandled
+- status
+
+6.2 What is persisted on the client
+
+The frontend stores only:
+
+- lb_token
+- lb_user
+
+This keeps browser persistence limited to session state, while simulation history remains server-side.
+
+6.3 Practical persistence behavior
+
+- Recent history shown in the dashboard is per user.
+- Only the latest three entries are returned by the backend.
+- Full requestRouting, metrics, and logs are not stored in MongoDB at present.
+
+
+7. Algorithm Catalog
+--------------------
+The simulator implements a broad set of routing strategies. For technical review, the most important point is not just the name of each algorithm, but the exact decision rule used in this codebase.
+
+7.1 Core and adaptive strategies
+
+roundrobin
+- Uses a stable cursor over available servers.
+- Best as a homogeneous baseline with near-zero decision overhead.
+- Ignores live pressure, latency, and capacity differences.
+
+swrr
+- Implements Smooth Weighted Round Robin using currentWeight and effectiveWeight.
+- Produces smoother weighted distribution than naive weighted cycling.
+- In this simulator, weights exist but there is no dynamic failure feedback, so effectiveWeight is not actively degraded by health events.
+
+least
+- Picks the server with the fewest activeConnections and breaks ties by serverId.
+- Appropriate when long-lived connections create uneven concurrency.
+- In this simulator, activeConnections are incremented on arrivals but not decremented later, so the signal behaves more like accumulated in-flight pressure than a true completion-aware connection count.
+
+leastoutstanding
+- Uses currentLoad / maxCapacity as the decision ratio.
+- Better than raw connection count when server capacity differs.
+- Still depends on a simplified load model rather than real service completion.
+
+p2c
+- Samples two random servers and keeps the lower-pressure choice.
+- Useful because it approximates good balancing with lower coordination cost than global least-loaded selection.
+- Good compromise between simplicity and adaptability.
+
+p2cewma
+- Samples two servers, then compares (activeConnections + 1) * ewma.
+- Adds a latency-sensitive signal to the P2C pattern.
+- Useful when queueing delay matters more than raw count.
+
+iphash
+- Hashes sourceIP and maps it to one server modulo the active pool.
+- Useful for stickiness and repeatable routing.
+- Simple, but can be uneven if client IP distribution is skewed.
+
+7.2 Hash-based and locality-aware strategies
+
+ringhash
+- Builds a consistent hash ring with 150 virtual nodes per server.
+- Looks up request key placement using binary search on the ring.
+- Good for stable mapping when the server set changes, but distribution quality still depends on key shape and ring population.
+
+maglev
+- Builds a Maglev lookup table with a prime table size and backend-specific permutations.
+- Designed for stable, fast hash-based lookup with better spread properties than naive hashing.
+- Good for high-speed deterministic routing and remap stability.
+
+hrw
+- Uses Highest Random Weight / Rendezvous Hashing.
+- Computes a score for each server for the given request and picks the maximum.
+- Good when deterministic placement is needed without maintaining a full ring structure.
+
+localityaware
+- Derives a synthetic client zone, prefers same-zone servers, then chooses the lowest load ratio in that zone.
+- This models the idea of locality-weighted routing rather than full production locality policy.
+- Useful for demonstrating how topology preference and balancing interact.
+
+boundedch
+- Starts with consistent hashing, then rejects candidates that exceed a bounded-load threshold.
+- The threshold is based on average active load times (1 + epsilon), with epsilon fixed at 0.25 here.
+- Good when consistency is desired without allowing one backend to become too hot.
+
+aperture
+- Builds a sliding subset of servers rather than considering the full pool every time.
+- Subset size is roughly sqrt(N), bounded to stay practical for small pools.
+- Inside the subset, the simulator uses a two-choice style pick based on server pressure.
+- This models subsetting and reduced-decision-scope balancing.
+
+7.3 Randomized and queue-oriented strategies
+
+random
+- Picks a server uniformly at random.
+- Extremely cheap and useful as a statistical baseline.
+- Can perform surprisingly well at scale, but does not honor capacity or latency directly.
+
+weighted
+- Current backend behavior is weight-proportional random selection.
+- Important implementation note: the frontend labels this as "Weighted Round Robin", but the backend logic is actually weighted random, not deterministic weighted round-robin cycling.
+- This should be treated as a current naming mismatch rather than a conceptual feature.
+
+jsq
+- Join Shortest Queue is approximated with the smallest activeConnections value.
+- In a simulator without explicit queue objects, this collapses close to least-connections behavior.
+- Useful as a queue-oriented reference point, but simplified here.
+
+jiq
+- Join Idle Queue prefers idle servers first.
+- If none are idle, it falls back to a P2C-style comparison among busy servers.
+- Useful for showing aggressive exploitation of idle capacity.
+
+sed
+- Shortest Expected Delay uses (activeConnections + 1) / weight.
+- Balances queue pressure against server weight.
+- Better suited than plain least-connections when backend capacity differs.
+
+weightedrandomam
+- Starts with server weights, then penalizes them for high utilization and high ewma latency.
+- Utilization penalties are stronger above 70 percent and severe above 90 percent.
+- ewma above 50 further reduces effective probability.
+- This is a practical resilience-oriented variant for avoiding hot or slow servers.
+
+7.4 How the simulator uses algorithms in practice
+
+Algorithm choice is not the last word in routing. After a preferred server is chosen, the system still performs:
+
+- capacity validation,
+- overflow rerouting,
+- auto-scaling fallback if the current pool cannot safely accept the request.
+
+That means the simulation models both pure routing preference and operational protection behavior.
+
+
+8. Performance and Metrics
+--------------------------
+8.1 Primary metrics
+
+The simulator computes:
+
+- avgLoad: average handled requests per server
+- maxLoad and minLoad
+- totalLoad
+- overloadedCount
+- highCount
+- stdDev
+- efficiencyScore
+- avgLatency
+- p50Latency
+- p95Latency
+- p99Latency
+- throughput
+- fairnessIndex
+
+8.2 Fairness model
+
+Fairness uses Jain's Fairness Index:
+
+F = (sum(xi)^2) / (n * sum(xi^2))
+
+Interpretation:
+
+- 1.0 means perfectly balanced
+- values closer to 0 indicate stronger imbalance
+
+8.3 Efficiency score
+
+The current formula is:
+
+- fairnessIndex * 100
+- minus 5 points per overloaded server
+- clamped to a minimum of 0
+
+This makes the score easy to explain to reviewers: balanced systems score well, and overload events degrade that score quickly.
+
+8.4 Throughput and latency
+
+- Throughput is derived from request count over simulated time.
+- Average and percentile latencies come from the synthetic duration model that scales with server utilization and base latency.
+- P95 and P99 are useful for reviewing tail behavior rather than only averages.
+
+8.5 Status thresholds
+
+Backend final status:
+
+- Overloaded at 90 percent and above
+- High at 60 percent and above
+- Normal below that
+
+Frontend visual status:
+
+- Medium at 50 percent and above
+- High at 70 percent and above
+- Overloaded at 90 percent and above
+
+This means the UI is intentionally more expressive than the final backend summary state.
+
+8.6 Validation note
+
+The repository already includes backend/test_algorithms.js as a smoke test. On the current run used for verification:
+
+- ring hash fairness on 4 servers over 1000 requests: 0.9785
+- ring hash fairness on 8 servers over 2000 requests: 0.9895
+- Murmur3 bucket fairness across 10 buckets: 0.9993
+
+This is not a benchmark suite, but it does confirm that the ring-hash path is at least distributing traffic across the full server pool.
+
+
+9. My Contribution
+------------------
+I positioned this project as more than a visual demo. My main contribution was turning it into a full-stack technical simulator with a usable frontend, authenticated workflows, persistent history, and a backend that can explain and compare a wide range of load-balancing strategies.
+
+Specifically, my contribution is best described as the end-to-end ownership layer:
+
+- I shaped the system as a React plus Express plus MongoDB application rather than a one-page static visualization.
+- I integrated authentication, session restoration, and protected simulation endpoints so the simulator behaves like a real product, not only a classroom script.
+- I connected the frontend controls, charts, analytics, activity logs, and reset/stop flows into one coherent simulation workflow.
+- I built or coordinated the backend simulation flow that generates workloads, routes requests, tracks per-server state, computes metrics, and returns data that the UI can animate.
+- I made the comparison mode meaningful by ensuring all algorithms in a compare run are evaluated on the same generated request set.
+- I incorporated overload-aware rerouting and auto-scaling so the simulator reflects operational decision layers beyond naive algorithm selection.
+- I treated the project as a technical explanation tool: the output is not just which server got traffic, but why a strategy behaved the way it did.
+
+From a systems perspective, my role was the integrator and primary owner of the full experience:
+
+- product behavior
+- architecture
+- frontend workflow
+- backend orchestration
+- algorithm exposure
+- data persistence
+- technical explanation
+
+
+10. Team Contributions
+----------------------
+The four roles below represent the team contribution model for this project briefing. They are written as subsystem ownership descriptions, not as a git-forensics claim.
+
+Frontend Engineer
+- Built and refined the React UI layer for authentication, navigation, simulation controls, dashboards, analytics, charts, and live activity display.
+- Contributed user-facing behaviors such as progress tracking, server-card highlighting, history presentation, reset confirmation, and interactive filtering.
+- Helped ensure that complex backend output is understandable through a structured visual interface.
+
+Backend/API Engineer
+- Implemented the Express API surface and the core simulation-response contract used by the frontend.
+- Owned endpoint structure, request parsing, protected routing, simulation execution wiring, comparison execution, and safe response shaping.
+- Contributed the reroute-first and auto-scale fallback behavior that makes the simulator operationally interesting rather than purely theoretical.
+
+Database/Auth Engineer
+- Implemented user registration, password hashing, login, JWT issuance, protected identity lookup, and MongoDB persistence models.
+- Defined what should be persisted server-side versus client-side.
+- Enabled per-user simulation history so the simulator has continuity across sessions.
+
+Algorithm and Research Engineer
+- Implemented and organized the algorithm catalog, supporting data structures, and synthetic metrics needed for comparative analysis.
+- Added hashing utilities, ring-hash and Maglev structures, latency-aware routing signals, locality simulation, and bounded-load logic.
+- Contributed the research framing that helps connect textbook strategies to an inspectable software artifact.
+
+
+11. Limitations and Future Improvements
+---------------------------------------
+11.1 Current limitations
+
+Arrival-only simulation
+- The engine currently models arrivals only.
+- Requests are not completed and removed later from activeConnections or currentLoad.
+- This means the simulator is better at comparing routing distribution than at modeling a full queueing lifecycle.
+
+Monotonic activeConnections
+- activeConnections continuously increase during a run.
+- Algorithms such as least-connections, JSQ, JIQ, and SED therefore operate on a simplified pressure signal rather than a full concurrency model.
+
+Weighted label mismatch
+- The frontend label "Weighted Round Robin" does not exactly match the backend logic, which currently performs weighted random selection.
+
+Failure modeling is partial
+- The server object contains isDown and effectiveWeight fields, but the simulator does not yet include a full dynamic health-check or failure-injection pipeline.
+
+Heterogeneous mode is backend-ready but not frontend-exposed
+- The backend accepts a heterogeneous query flag and can alter server capacity and weight accordingly.
+- The current frontend does not expose that toggle.
+
+Persistence is summary-only
+- Simulation history stores summary snapshots, not full routing traces or metric time-series.
+
+11.2 Recommended next steps
+
+- Add completion events so activeConnections and currentLoad rise and fall over simulated time.
+- Expose heterogeneous server mode in the UI.
+- Add sticky-session analysis and request-affinity studies.
+- Add failure injection for server-down scenarios and effectiveWeight decay/recovery.
+- Add export features for result snapshots and comparison reports.
+- Store richer historical metrics for trend review across runs.
+- Add real workload trace import instead of relying only on synthetic traffic generation.
+
+
+12. References
+--------------
+The references below are supporting context for algorithm terminology and production-grade load-balancing patterns. Project-specific behavior still comes from the repository code.
+
+[R1] NGINX Documentation, "Using nginx as HTTP load balancer"
+https://nginx.org/en/docs/http/load_balancing.html
+
+[R2] Envoy Documentation, "Load balancer architecture overview"
+https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancing
+
+[R3] Envoy Documentation, "Supported load balancers"
+https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers.html
+
+[R4] Google Research, "Maglev: A Fast and Reliable Software Network Load Balancer"
+https://research.google/pubs/pub44824
+
+[R5] Google Research, "Consistent Hashing with Bounded Loads"
+https://research.google/pubs/consistent-hashing-with-bounded-loads/
+
+[R6] Reddit discussion, "Is the term 'least connections' in load balancing algorithms misused?"
+https://www.reddit.com/r/networking/comments/1iu997i
+
+[R7] Reddit discussion, "Load Balancing: The Intuition Behind the Power of Two Random Choices"
+https://www.reddit.com/r/programming/comments/15owg99
+
+
+Closing summary
+---------------
+This project is a technically rich simulator rather than a minimal demo. It combines an authenticated React dashboard, an Express simulation backend, MongoDB-backed history, and a broad algorithm catalog into one system that can be reviewed from both a software-engineering and systems-design perspective.
+
+The strongest part of the project is not a single algorithm. It is the fact that the project turns algorithm theory into an inspectable, interactive, full-stack system with measurable outputs, visible routing behavior, and enough surrounding product structure to support serious technical discussion.

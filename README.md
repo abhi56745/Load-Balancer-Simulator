@@ -6,6 +6,12 @@
   <p>
     <strong>A modern full-stack dashboard to simulate, analyze, and compare load balancing strategies.</strong>
   </p>
+  
+  <p>
+    <a href="http://loadbalancer-simulator-frontend-2026-ab.s3-website.ap-south-1.amazonaws.com/" target="_blank">
+      <img src="https://img.shields.io/badge/🔴%20Live%20Demo-Click%20Here-success?style=for-the-badge" alt="Live Demo Available" />
+    </a>
+  </p>
 </div>
 
 ---
